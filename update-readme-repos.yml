@@ -1,0 +1,185 @@
+name: Update README with contributed public repositories
+
+on:
+  schedule:
+    #        ┌───────────── minute (0 - 59)
+    #        │ ┌───────────── hour (0 - 23)
+    #        │ │ ┌───────────── day of the month (1 - 31)
+    #        │ │ │ ┌───────────── month (1 - 12 or JAN-DEC)
+    #        │ │ │ │ ┌───────────── day of the week (0 - 6 or SUN-SAT)
+    #        │ │ │ │ │
+    #        │ │ │ │ │
+    #        * * * * *
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-readme-repos:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install Python dependencies
+        run: pip install requests beautifulsoup4
+
+      - name: Detect contributed repos and update README.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+          GITHUB_USERNAME: ${{ github.actor }}
+          EXCLUDED_REPOS: ${{ vars.EXCLUDED_REPOS }}
+        run: |
+          python <<EOF
+          import os
+          import requests
+          import time
+          from bs4 import BeautifulSoup
+
+          GITHUB_USERNAME = os.getenv("GITHUB_USERNAME")
+          GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+          HEADERS = {"Authorization": f"token {GITHUB_TOKEN}"}
+          API_BASE = "https://api.github.com"
+
+          def search_repos_from_commits(username):
+              repos = set()
+              page = 1
+
+              while True:
+                  url = f"{API_BASE}/search/commits?q=author:{username}&per_page=100&page={page}"
+                  headers = HEADERS.copy()
+                  headers["Accept"] = "application/vnd.github.cloak-preview+json"
+                  response = requests.get(url, headers=headers)
+
+                  if response.status_code != 200:
+                      break
+
+                  data = response.json()
+
+                  for item in data.get("items", []):
+                      repos.add(item["repository"]["full_name"])
+
+                  if "next" not in response.links:
+                      break
+
+                  page += 1
+                  time.sleep(0.2)
+
+              return repos
+
+          def get_candidate_repos_by_contribution(username):
+              repos = set()
+              sources = [
+                  f"/users/{username}/repos?per_page=100",
+                  f"/users/{username}/events/public?per_page=100",
+                  f"/search/issues?q=author:{username}+type:pr&per_page=100",
+              ]
+
+              for path in sources:
+                  url = f"{API_BASE}{path}"
+                  page = 1
+
+                  while True:
+                      paginated_url = url + f"&page={page}" if "?" in url else url + f"?page={page}"
+                      response = requests.get(paginated_url, headers=HEADERS)
+
+                      if response.status_code != 200:
+                          break
+
+                      data = response.json()
+                      items = data if isinstance(data, list) else data.get("items", [])
+
+                      for item in items:
+                          repo_url = item.get("repository_url") or item.get("repo", {}).get("url")
+
+                          if repo_url:
+                              repo_full = repo_url.replace("https://api.github.com/repos/", "")
+                              repos.add(repo_full)
+
+                      if "next" not in response.links:
+                          break
+
+                      page += 1
+                      time.sleep(0.2)
+
+              return repos
+
+          def is_repo_public(repo_full_name):
+              url = f"{API_BASE}/repos/{repo_full_name}"
+              r = requests.get(url, headers=HEADERS)
+              return r.status_code == 200 and not r.json().get("private", True)
+
+          def has_commits_in_repo(repo_full_name, username):
+              url = f"{API_BASE}/repos/{repo_full_name}/commits?author={username}&per_page=1"
+              r = requests.get(url, headers=HEADERS)
+              return r.status_code == 200 and len(r.json()) > 0
+
+          print("[*] Search for public repositories with contributions...")
+
+          repos_from_search = search_repos_from_commits(GITHUB_USERNAME)
+          candidate_repos = get_candidate_repos_by_contribution(GITHUB_USERNAME)
+          all_repos = repos_from_search.union(candidate_repos)
+
+          confirmed_repos = set()
+
+          excluded = set([r.strip() for r in os.getenv("EXCLUDED_REPOS", "").split(",") if r.strip()])
+
+          for repo in all_repos:
+              if repo in excluded:
+                  continue
+
+              if is_repo_public(repo) and has_commits_in_repo(repo, GITHUB_USERNAME):
+                  confirmed_repos.add(repo)
+
+              time.sleep(0.2)
+
+          print(f"\n[✓] Public deposits confirmed with contribution ({len(confirmed_repos)}):")
+
+          for repo in sorted(confirmed_repos):
+              print(f"- {repo}")
+
+          readme_path = "README.md"
+
+          with open(readme_path, "r") as f:
+              readme_content = f.read()
+
+          soup = BeautifulSoup(readme_content, "html.parser")
+          repos_div = soup.find("div", {"id": "repos"})
+
+          if repos_div:
+              repos_div.clear()
+          else:
+              repos_div = soup.new_tag("div", id="repos")
+              soup.body.append(repos_div)
+
+          for repo in sorted(confirmed_repos):
+              owner, name = repo.split("/")
+              repo_url = f"https://github.com/{repo}"
+              a_tag = soup.new_tag("a", href=repo_url)
+              img_tag = soup.new_tag("img", src=f"https://github-stats.colindeseroux.fr/pin/?username={owner}&repo={name}&theme=tokyonight&border_color=2e4058", alt=name)
+              a_tag.append(img_tag)
+              repos_div.append(a_tag)
+              repos_div.append(" ")
+
+          with open(readme_path, "w") as f:
+              f.write(str(soup))
+
+          print("✅ README.md updated with public repositories")
+          EOF
+
+      - name: Commit and push changes
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add README.md
+          git diff --cached --quiet && echo "No changes to commit." && exit 0
+          git commit -m ":memo: Update README.md with contributed public repositories [skip ci]"
+          git push
